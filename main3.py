@@ -18,49 +18,18 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtCore import QUrl, pyqtSlot
+from PyQt5.QtCore import QUrl, pyqtSlot, QSize
+from PyQt5.QtGui import QFont
+import tempfile
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import requests
+from googleapiclient.errors import HttpError
+import io
+import urllib.parse
+from googleapiclient import errors
 
 # If modifying these SCOPES, delete the file token.pickle.
 SCOPES = ['https://www.googleapis.com/auth/drive.metadata.readonly']
-
-def get_drive_service():
-    """Shows basic usage of the Drive v3 API.
-    Prints the names and ids of the first 10 files the user has access to.
-    """
-    creds = None
-    # The file token.pickle stores the user's access and refresh tokens, and is
-    # created automatically when the authorization flow completes for the first
-    # time.
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
-
-    service = build('drive', 'v3', credentials=creds)
-    return service
-
-def list_files(service):
-    # Call the Drive v3 API
-    results = service.files().list(
-        pageSize=10, fields="nextPageToken, files(id, name)").execute()
-    items = results.get('files', [])
-
-    if not items:
-        print('No files found.')
-    else:
-        print('Files:')
-        for item in items:
-            print(f"{item['name']} ({item['id']})")
 
 # Create a translator object
 translator = GoogleTranslator(source='auto', target='english')
@@ -68,8 +37,8 @@ translator = GoogleTranslator(source='auto', target='english')
 # Create a Qt application
 app = QApplication([])
 
-def authenticate_google_drive(self):
-    self.creds = None
+def authenticate_google_drive():
+    creds = None
     SCOPES = ['https://www.googleapis.com/auth/drive.metadata.readonly', 
               'https://www.googleapis.com/auth/userinfo.email', 
               'https://www.googleapis.com/auth/userinfo.profile',
@@ -78,42 +47,91 @@ def authenticate_google_drive(self):
     # Check if token.pickle file exists and is not empty
     if os.path.exists('token.pickle') and os.path.getsize('token.pickle') > 0:
         with open('token.pickle', 'rb') as token:
-            self.creds = pickle.load(token)
+            creds = pickle.load(token)
     else:
         # If there are no (valid) credentials available, let the user log in.
-        if self.creds and self.creds.expired and self.creds.refresh_token:
-            self.creds.refresh(Request())
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(
                 'credentials.json', SCOPES)  # here enter the name of your downloaded JSON file
-            self.creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0)
         # Save the credentials for the next run
         with open('token.pickle', 'wb') as token:
-            pickle.dump(self.creds, token)
+            pickle.dump(creds, token)
             
     # Call the Drive v3 API
-    drive_service = build('drive', 'v3', credentials=self.creds)
+    drive_service = build('drive', 'v3', credentials=creds)
     # Call the People API to get the user's email
-    people_service = build('people', 'v1', credentials=self.creds)
+    people_service = build('people', 'v1', credentials=creds)
     profile = people_service.people().get(resourceName='people/me', personFields='emailAddresses').execute()
     email = profile['emailAddresses'][0]['value']
     
     return drive_service, email
 
-def upload_file_to_google_drive(drive, local_file_path, google_folder_id):
-    gfile = drive.CreateFile({"title": os.path.basename(local_file_path), "parents": [{"id": google_folder_id}]})
-    gfile.SetContentFile(local_file_path)
-    gfile.Upload()
+def download_file(drive_service, file_id, directory_path, file_name, translated_root_id, override=False):
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)  # Create the directory if it doesn't exist
 
-def download_file_from_google_drive(drive, google_file_id, local_directory):
-    gfile = drive.CreateFile({'id': google_file_id})
-    local_file_path = os.path.join(local_directory, gfile['title'])
-    gfile.GetContentFile(local_file_path)
-    return local_file_path
+    translated_file_name = translate_file_name(file_name)
+    file_path = os.path.join(directory_path, translated_file_name)
 
-def get_google_drive_folder_file_ids(drive, folder_id):
-    file_list = drive.ListFile({'q': f"'{folder_id}' in parents"}).GetList()
-    return [file['id'] for file in file_list]
+    # Check if the file already exists in the translated_root_id directory on Google Drive
+    encoded_filename = urllib.parse.quote(translated_file_name)
+    response = drive_service.files().list(
+        q=f"name='{encoded_filename}' and '{translated_root_id}' in parents",
+        fields='files(id, name)').execute()
+    
+    if response.get('files') and not override:
+        print(f"File '{translated_file_name}' already exists in parent folder ID '{translated_root_id}'")
+        return None  # Return None if the file already exists
+    
+    elif response.get('files') and override:
+        # Get the ID of the file to delete
+        file_to_delete_id = response.get('files')[0]['id']
+        delete_file(drive_service, file_to_delete_id)  # Delete the existing file
+    
+    # If the file does not exist, download it
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+    with open(file_path, 'wb') as f:
+        f.write(fh.getbuffer())
+
+    return file_path
+
+def upload_file(drive_service, file_path, parent_folder_id, override=True):
+    file_metadata = {
+        'name': os.path.basename(file_path),
+        'parents': [parent_folder_id]
+    }
+
+    # Check if the file already exists in the parent_folder_id directory on Google Drive
+    response = drive_service.files().list(
+        q=f"name='{file_metadata['name']}' and '{parent_folder_id}' in parents",
+        fields='files(id, name)').execute()
+    
+    if response.get('files') and not override:
+        print(f"File '{file_metadata['name']}' already exists in parent folder ID '{parent_folder_id}'")
+        return  # Do not upload the file if it already exists
+    
+    elif response.get('files') and override:
+        # Get the ID of the file to delete
+        file_to_delete_id = response.get('files')[0]['id']
+        delete_file(drive_service, file_to_delete_id)  # Delete the existing file
+    
+    media = MediaFileUpload(file_path)
+    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    print(f"File uploaded with ID: {file.get('id')}")
+
+def delete_file(drive_service, file_id):
+    try:
+        drive_service.files().delete(fileId=file_id).execute()
+    except errors.HttpError as error:
+        print(f'An error occurred: {error}')
 
 def select_directory():
     dialog = QFileDialog()
@@ -140,6 +158,56 @@ def log_message(log, message):
 
     # Process events to make sure GUI updates immediately
     QApplication.processEvents()
+
+def upload_directory_to_drive(drive_service, directory_path, parent_folder_id):
+    for file_name in os.listdir(directory_path):
+        file_path = os.path.join(directory_path, file_name)
+
+        if os.path.isfile(file_path):
+            # Upload file
+            file_metadata = {
+                'name': file_name,
+                'parents': [parent_folder_id]
+            }
+            media = MediaFileUpload(file_path)
+            drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        else:
+            # Create folder on Drive
+            folder_metadata = {
+                'name': file_name,
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [parent_folder_id]
+            }
+            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+
+            # Upload files in the folder
+            upload_directory_to_drive(drive_service, file_path, folder.get('id'))
+
+def download_directory_from_drive(drive_service, folder_id, local_directory):
+    query = f"'{folder_id}' in parents and trashed=false"
+    results = drive_service.files().list(q=query).execute()
+    items = results.get('files', [])
+
+    if not items:
+        print('No files found.')
+    else:
+        for item in items:
+            # If item is a file
+            if item['mimeType'] != 'application/vnd.google-apps.folder':
+                request = drive_service.files().get_media(fileId=item['id'])
+                fh = io.FileIO(os.path.join(local_directory, item['name']), 'wb')
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while done is False:
+                    status, done = downloader.next_chunk()
+                print(f"Downloaded file: {item['name']}")
+            # If item is a directory
+            else:
+                sub_dir_path = os.path.join(local_directory, item['name'])
+                if not os.path.exists(sub_dir_path):
+                    os.makedirs(sub_dir_path)
+                # Recursively download the subdirectory
+                download_directory_from_drive(drive_service, item['id'], sub_dir_path)
 
 def translate_files_local_to_local(source_directory, target_directory, label, log):
     # Define a set of file extensions for which the name translation should be skipped
@@ -192,17 +260,136 @@ def translate_files_local_to_local(source_directory, target_directory, label, lo
                     log_message(log, f"Failed to copy file {source_item_path} to {target_item_path}: {e}")  # Replaces `print(...)`
     log_message(log, 'Translation finished')  # Replaces `label.setText('Translation finished')`
 
-def translate_files_local_to_drive(source_directory, google_folder_id, drive, label, log):
-    # similar to translate_files_local_to_local, but instead of copying files to the target directory, it uploads them to Google Drive
-    pass
+def translate_files_local_to_drive(source_directory, target_folder_id, drive_service, label, log):
+    # Create a temporary directory to store translated files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Translate files
+        translate_files_local_to_local(source_directory, temp_dir, label, log)
+        # Upload translated files to Drive
+        upload_directory_to_drive(drive_service, temp_dir, target_folder_id)
 
-def translate_files_drive_to_local(google_folder_id, target_directory, drive, label, log):
-    # similar to translate_files_local_to_local, but instead of reading files from the source directory, it downloads them from Google Drive
-    pass
+def translate_files_drive_to_local(source_folder_id, target_directory, drive_service, label, log):
+    # Create a temporary directory to store the downloaded files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Download files from Drive
+        download_directory_from_drive(drive_service, source_folder_id, temp_dir)
+        # Translate downloaded files and save them to target_directory
+        translate_files_local_to_local(temp_dir, target_directory, label, log)
 
-def translate_files_drive_to_drive(source_folder_id, target_folder_id, drive, label, log):
-    # similar to translate_files_local_to_local, but instead of reading files from the source directory and copying them to the target directory, it downloads them from the source Google Drive folder and uploads them to the target Google Drive folder
-    pass
+def create_folder(drive_service, name, parent_id):
+    name = sanitize_name(name)  # Remove illegal characters from the folder name
+
+    # Check if the folder already exists
+    response = drive_service.files().list(
+        q=f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'",
+        spaces='drive',
+        fields='files(id, name)').execute()
+    
+    if response.get('files'):
+        folder_id = response.get('files')[0].get('id')
+        print(f"Folder '{name}' already exists in parent folder ID '{parent_id}'")
+        return folder_id, False  # Return False indicating the folder already exists
+
+    # Create the folder if it doesn't exist
+    file_metadata = {
+        'name': name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_id]
+    }
+    file = drive_service.files().create(body=file_metadata,
+                                        fields='id').execute()
+    
+    print(f"Folder '{name}' created in parent folder ID '{parent_id}'")
+    return file.get('id'), True  # Return True indicating the folder is newly created
+
+def copy_and_rename_file(drive_service, file_id, translated_root_id, translated_file_name, override=False):
+    # Make a copy of the original file in the new directory
+    file_metadata = {
+        'name': translated_file_name,
+        'parents': [translated_root_id]
+    }
+
+    # Check if the file already exists in the translated_root_id directory on Google Drive
+    response = drive_service.files().list(
+        q=f"name='{translated_file_name}' and '{translated_root_id}' in parents",
+        fields='files(id, name)').execute()
+    
+    if response.get('files') and not override:
+        print(f"File '{translated_file_name}' already exists in parent folder ID '{translated_root_id}'")
+        return  # Do not copy the file if it already exists
+    
+    elif response.get('files') and override:
+        # Get the ID of the file to delete
+        file_to_delete_id = response.get('files')[0]['id']
+        delete_file(file_to_delete_id)  # Delete the existing file
+    
+    copied_file = drive_service.files().copy(
+        fileId=file_id,
+        body=file_metadata,
+        fields='id'
+    ).execute()
+    print(f"File copied and renamed with ID: {copied_file.get('id')}")
+
+def translate_files_drive_to_drive(source_folder_id, target_folder_id, drive_service, label, log, start_file=None, convert_docs=False, override_docs=False, convert_slides=False, override_slides=False, copy_translate_others=False, override_others=False):
+    results = drive_service.files().list(
+        q=f"'{source_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
+        fields="files(id, name)").execute()
+
+    items = results.get('files', [])
+
+    for item in items:
+        subdirectory_id = item['id']
+        file_name = translate_text(item['name'])
+
+        global start_translating
+        if start_file and not start_translating and file_name == start_file:
+            start_translating = True
+
+        translated_subdirectory_id, is_new_folder = create_folder(drive_service, file_name, target_folder_id)
+        if is_new_folder:  # Only process the subdirectory if it is newly created
+            print(f"Processing subdirectory '{item['name']}' with ID '{subdirectory_id}'")
+            translate_files_drive_to_drive(subdirectory_id, translated_subdirectory_id, drive_service, label, log, start_file, convert_docs, override_docs, convert_slides, override_slides, copy_translate_others, override_others)
+        #else:
+        #    print(f"Processing subdirectory '{item['name']}' with ID '{subdirectory_id}'")
+        #    translate_files_drive_to_drive(subdirectory_id, translated_subdirectory_id, drive_service, label, log, start_file, convert_docs, override_docs, convert_slides, override_slides, copy_translate_others, override_others)
+
+    results = drive_service.files().list(
+        q=f"'{source_folder_id}' in parents and mimeType!='application/vnd.google-apps.folder'",
+        fields="files(id, name, mimeType)").execute()
+    items = results.get('files', [])
+
+    local_directory_path = os.path.join('./temp_drive_files', source_folder_id)
+    for item in items:
+        if not start_translating:
+            continue
+
+        file_name = item['name']
+        file_id = item['id']
+        translated_file_name = translate_file_name(file_name)
+
+        encoded_filename = urllib.parse.quote(translated_file_name)
+        response = drive_service.files().list(
+            q=f"name='{encoded_filename}' and '{target_folder_id}' in parents",
+            fields='files(id, name)').execute()
+        if response.get('files'):
+            print(f"File '{translated_file_name}' already exists in parent folder ID '{target_folder_id}'")
+            continue
+
+        if item['mimeType'] in ['application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'] and convert_docs:
+            file_path = download_file(file_id, local_directory_path, file_name, target_folder_id, False)
+            if item['mimeType'] == 'application/msword':
+                file_path = convert_doc_to_docx(file_path)
+            translated_file_path = translate_docx(file_path)
+            upload_file(translated_file_path, target_folder_id, override_docs)
+            os.remove(translated_file_path)
+        elif item['mimeType'] == 'application/vnd.openxmlformats-officedocument.presentationml.presentation' and convert_slides:
+            file_path = download_file(file_id, local_directory_path, file_name, target_folder_id, False)
+            translated_file_path = translate_pptx(file_path)
+            upload_file(translated_file_path, target_folder_id, override_slides)
+            os.remove(translated_file_path)
+        elif copy_translate_others:
+            translated_file_name = translate_file_name(file_name)
+            copy_and_rename_file(file_id, target_folder_id, translated_file_name, override_others)
 
 def sanitize_name(name):
     invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
@@ -416,59 +603,97 @@ class MainWindow(QMainWindow):
 
         # Initialize source_directory_drive and target_directory_drive
         self.source_directory_drive = None
+        self.source_directory_local = None
         self.target_directory_drive = None
+        self.target_directory_local = None
+
+        # Checks
+        self.isSource = [False]
+        self.isTarget = [False]
+        self.isDrive = [False]
 
         self.setWindowTitle('My Window')
 
-        # Initialize QWebEngineView
-        self.web_view = QWebEngineView()
+        # Create QFont object for buttons and labels
+        self.button_font = QFont()
+        self.button_font.setPointSize(14)  # Change this value to adjust the font size
 
-        self.google_drive_button = QPushButton('Authenticate with Google Drive')
-        self.source_button_local = QPushButton('Select Source Directory (Local)')
-        self.source_button_drive = QPushButton('Select Source Directory (Google Drive)')
-        self.target_button_local = QPushButton('Select Target Directory (Local)')
-        self.target_button_drive = QPushButton('Select Target Directory (Google Drive)')
+        google_drive_button = QPushButton('Authenticate with Google Drive')
+        google_drive_button.setFont(self.button_font)
+        source_button_local = QPushButton('Select Source Directory (Local)')
+        source_button_local.setFont(self.button_font)
+        source_button_drive = QPushButton('Select Source Directory (Google Drive)')
+        source_button_drive.setFont(self.button_font)
+        target_button_local = QPushButton('Select Target Directory (Local)')
+        target_button_local.setFont(self.button_font)
+        target_button_drive = QPushButton('Select Target Directory (Google Drive)')
+        target_button_drive.setFont(self.button_font)
         self.start_button = QPushButton('Start Translations')
-        self.google_user_label = QLabel("Google User: Not Authenticated")
-        self.label = QLabel()
-        self.source_directory_label_local = QLabel("Source Directory (Local): Not Selected")
-        self.source_directory_label_drive = QLabel("Source Directory (Drive): Not Selected")
-        self.target_directory_label_local = QLabel("Target Directory (Local): Not Selected")
-        self.target_directory_label_drive = QLabel("Target Directory (Drive): Not Selected")
+        self.start_button.setFont(self.button_font)
 
+        # Create QFont object for labels
+        label_font = QFont()
+        label_font.setPointSize(12)  # Change this value to adjust the font size
+
+        self.google_user_label = QLabel("Google User: Not Authenticated")
+        self.google_user_label.setFont(label_font)
+        label = QLabel()
+        label.setFont(label_font)
+        self.source_directory_label_local = QLabel("Source Directory (Local): Not Selected")
+        self.source_directory_label_local.setFont(label_font)
+        self.source_directory_label_drive = QLabel("Source Directory (Drive): Not Selected")
+        self.source_directory_label_drive.setFont(label_font)
+        self.target_directory_label_local = QLabel("Target Directory (Local): Not Selected")
+        self.target_directory_label_local.setFont(label_font)
+        self.target_directory_label_drive = QLabel("Target Directory (Drive): Not Selected")
+        self.target_directory_label_drive.setFont(label_font)
         # Initialize QTextEdit for status log
         self.log = QTextEdit()
         self.log.setReadOnly(True)
 
-        self.google_drive_button.clicked.connect(
+        google_drive_button.clicked.connect(
             lambda: (
                 setattr(self, 'drive', authenticate_google_drive()[0]),
                 self.google_user_label.setText(f'Google User: {authenticate_google_drive()[1]}'),
-                self.source_button_drive.setEnabled(True)  # enable the Google Drive Source button here
-            ) # type: ignore
+                source_button_drive.setEnabled(True),
+                self.isDrive.__setitem__(0, True)
+            )
         )
-        
-        self.source_button_drive.clicked.connect(
-            lambda: self.show_google_picker(self.source_directory_label_drive, 'source')
-        )
-
-        self.target_button_drive.clicked.connect(
-            lambda: self.show_google_picker(self.target_directory_label_drive, 'target')
-        )
-
-        self.source_button_local.clicked.connect(
+        source_button_local.clicked.connect(
             lambda: (
+                self.clear_source_directory(),  # Clear existing source directory
                 setattr(self, 'source_directory_local', select_directory()),
                 self.source_directory_label_local.setText(f'Source Directory (Local): {self.source_directory_local}'),
-                self.target_button_local.setEnabled(True)
-            ) # type: ignore
+                target_button_local.setEnabled(True),
+                target_button_drive.setEnabled(True and self.isDrive[0]),
+                self.isSource.__setitem__(0, True)
+            )
         )
-        self.target_button_local.clicked.connect(
+        source_button_drive.clicked.connect(
             lambda: (
+                self.clear_source_directory(),  # Clear existing source directory
+                self.enter_folder_id(self.source_directory_label_drive, is_source=True),  # Pass 'is_source' parameter
+                target_button_local.setEnabled(True),
+                target_button_drive.setEnabled(True and self.isDrive[0]),
+                self.isSource.__setitem__(0, True)
+            )
+        )
+        target_button_local.clicked.connect(
+            lambda: (
+                self.clear_target_directory(),  # Clear existing target directory
                 setattr(self, 'target_directory_local', select_directory()),
                 self.target_directory_label_local.setText(f'Target Directory (Local): {self.target_directory_local}'),
-                self.start_button.setEnabled(True)
-            ) # type: ignore
+                self.start_button.setEnabled(True),
+                self.isTarget.__setitem__(0, True)
+            )
+        )
+        target_button_drive.clicked.connect(
+            lambda: (
+                self.clear_target_directory(),  # Clear existing target directory
+                self.enter_folder_id(self.target_directory_label_drive, is_source=False),  # Pass 'is_source' parameter
+                self.start_button.setEnabled(True),
+                self.isTarget.__setitem__(0, True)
+            )
         )
         self.start_button.clicked.connect(
             lambda: start_translations(
@@ -476,35 +701,36 @@ class MainWindow(QMainWindow):
                 self.source_directory_drive,
                 self.target_directory_local,
                 self.target_directory_drive,
-                self.label,
+                label,
                 getattr(self, 'drive', None),
                 self.log
             )
         )
 
-        self.source_button_drive.setEnabled(False)  # disable the Google Drive Source button by default
-        self.target_button_local.setEnabled(False)
-        self.target_button_drive.setEnabled(False)  # disable the Google Drive Target button by default
+        source_button_drive.setEnabled(False)
+        target_button_local.setEnabled(False)
+        target_button_drive.setEnabled(False)
         self.start_button.setEnabled(False)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.google_drive_button)
+        layout.addWidget(google_drive_button)
         layout.addWidget(self.google_user_label)
-        layout.addWidget(self.source_button_local)
-        layout.addWidget(self.source_button_drive)
-        layout.addWidget(self.target_button_local)
-        layout.addWidget(self.target_button_drive)
+        layout.addWidget(source_button_local)
+        layout.addWidget(source_button_drive)
+        layout.addWidget(target_button_local)
+        layout.addWidget(target_button_drive)
         layout.addWidget(self.source_directory_label_local)
         layout.addWidget(self.source_directory_label_drive)
         layout.addWidget(self.target_directory_label_local)
         layout.addWidget(self.target_directory_label_drive)
         layout.addWidget(self.start_button)
-        layout.addWidget(self.label)
+        layout.addWidget(label)
         layout.addWidget(self.log)  # Add status log to layout
 
         central_widget = QWidget()
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
+
 
     def log_message(self, message):
         # Update status label
@@ -516,75 +742,69 @@ class MainWindow(QMainWindow):
         # Process events to make sure GUI updates immediately
         QApplication.processEvents()
 
-    @pyqtSlot(str)
-    def on_folder_id_selected(self, folder_id):
-        self.selected_folder_id = folder_id
-        if self.drive_type == 'source':
+    def clear_source_directory(self):
+        # Reset both local and drive source directories
+        self.source_directory_local = None
+        self.source_directory_drive = None
+        # Also reset the labels
+        self.source_directory_label_local.setText("Source Directory (Local): Not Selected")
+        self.source_directory_label_drive.setText("Source Directory (Drive): Not Selected")
+
+    def clear_target_directory(self):
+        # Reset both local and drive target directories
+        self.target_directory_local = None
+        self.target_directory_drive = None
+        # Also reset the labels
+        self.target_directory_label_local.setText("Target Directory (Local): Not Selected")
+        self.target_directory_label_drive.setText("Target Directory (Drive): Not Selected")
+
+    def enter_folder_id(self, label, is_source):
+        # Create a new web view widget
+        view = QWebEngineView()
+
+        # Load the Google Drive Picker URL
+        view.load(QUrl('https://drive.google.com/drive/folders'))
+
+        # Show the web view widget in a new window
+        dialog = QDialog(self)
+        dialog.resize(800, 600)  # Change these values to adjust the dialog size
+        layout = QVBoxLayout()
+
+        choose_directory_button = QPushButton("Choose Current Directory")
+        choose_directory_button.setFont(self.button_font)  # Make sure to use the same font for this button
+        choose_directory_button.clicked.connect(lambda: self.choose_directory(view, label, is_source))  # Pass 'is_source' parameter
+        layout.addWidget(view)
+        layout.addWidget(choose_directory_button)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def choose_directory(self, view, label, is_source):
+        # Get the selected folder ID from the URL
+        url = view.url().toString()
+        folder_id = url.split('/')[-1]
+
+        # Set the folder ID to the corresponding label
+        label.setText(f"Selected Directory (Drive): {folder_id}")
+
+        # Save the folder ID to the appropriate attribute in the MainWindow object
+        if is_source:
             self.source_directory_drive = folder_id
-            self.target_button_drive.setEnabled(True)  # enable the Google Drive Target button here
-        elif self.drive_type == 'target':
+        else:
             self.target_directory_drive = folder_id
 
         # Enable the start button if both source and target directories are selected
         if self.source_directory_drive and self.target_directory_drive:
             self.start_button.setEnabled(True)
-
-        self.label.setText(f"Selected Directory (Drive): {folder_id}")
-
-    def show_google_picker(self, label, drive_type):
-        self.drive_type = drive_type  # remember if we are selecting a source or target directory
-        oauth_token = self.creds.token if self.creds else 'YOUR_OAUTH_TOKEN'  # replace with your actual token
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <body>
-            <!-- Load the Google Picker API -->
-            <script type="text/javascript" src="https://apis.google.com/js/api.js"></script>
-            <script type="text/javascript">
-            function onApiLoad() {{
-                gapi.load('picker', onPickerApiLoad);
-            }}
-
-            function onPickerApiLoad() {{
-                var view = new google.picker.DocsView(google.picker.ViewId.FOLDERS);
-                var picker = new google.picker.PickerBuilder()
-                    .addView(view)
-                    .setOAuthToken('{oauth_token}')  // use the actual token
-                    .setCallback(pickerCallback)
-                    .build();
-                picker.setVisible(true);
-            }}
-
-            function pickerCallback(data) {{
-                var folderId = '';
-                if (data[google.picker.Response.ACTION] == google.picker.Action.PICKED) {{
-                    var doc = data[google.picker.Response.DOCUMENTS][0];
-                    folderId = doc[google.picker.Document.ID];
-                }}
-                // Send the selected folder ID to the Python code
-                new QWebChannel(qt.webChannelTransport, function(channel) {{
-                    channel.objects.mainWindow.on_folder_id_selected(folderId);
-                }});
-            }}
-
-            window.onload = onApiLoad;
-            </script>
-        </body>
-        </html>
-        """
-
-        self.web_view.setHtml(html)
-        self.web_view.show()
-
+        # Add these new methods
+    
 def main():
     try:
         app = QApplication(sys.argv)
-        QApplication.setApplicationName('My Window')
-        window = MainWindow()
-
-        window.show()
-
-        app.exec_()
+        mainWin = MainWindow()
+        mainWin.resize(800, 600)  # Change these values to adjust the main window size
+        mainWin.show()
+        sys.exit(app.exec_())
     except Exception as e:
         print(f"Exception occurred: {e}")
         # re-raise the exception after printing
